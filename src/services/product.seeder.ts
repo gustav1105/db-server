@@ -2,10 +2,25 @@ import { Injectable, OnModuleInit } from '@nestjs/common';
 import { PrismaService } from './prisma.service';
 import { promises as fs } from 'fs';
 import * as path from 'path';
+import axios, { AxiosInstance } from 'axios';
+import {
+  productDetailProperties,
+  ProductDetails,
+} from '@/interfaces/product-details.interface';
 
 @Injectable()
 export class ProductSeedService implements OnModuleInit {
-  constructor(private readonly prisma: PrismaService) {}
+  private readonly axiosInstance: AxiosInstance;
+
+  constructor(private readonly prisma: PrismaService) {
+    this.axiosInstance = axios.create({
+      baseURL: 'https://api.openai.com/v1/',
+      headers: {
+        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+    });
+  }
 
   async onModuleInit() {
     await this.seedProducts();
@@ -20,38 +35,87 @@ export class ProductSeedService implements OnModuleInit {
       try {
         const productFiles = await fs.readdir(categoryPath);
 
-        for (const file of productFiles) {
-          const productData = {
-            summary: {
-              launchedAt: new Date(),
-              title: 'n/a',
-              description: 'n/a',
-              specifications: ['n/a'],
-              manufacturer: 'n/a',
-              websites: ['n/a'],
-            },
-            filename: file, // Add filename to details
-          };
+        for (const filename of productFiles) {
+          const filePath = path.join(categoryPath, filename); // Full path to the file
+
+          // Read the file content as a string
+          const fileContent = await fs.readFile(filePath, 'utf-8');
 
           // Check if a product with the same filename already exists
           const existingProduct = await this.prisma.productDetails.findUnique({
             where: {
-              filename: file,
+              filename: filename,
             },
           });
 
+          // If the product does not exist, parse the product details
           if (!existingProduct) {
-            await this.prisma.productDetails.create({
-              data: {
-                details: JSON.stringify(productData),
-                filename: productData.filename, // Save filename to the database
-              },
-            });
+            try {
+              const parsedDetails = await this.parseProductDetails(fileContent);
+
+              if (parsedDetails.choices[0].message.content) {
+                const productDetails: ProductDetails = JSON.parse(
+                  parsedDetails.choices[0].message.content,
+                );
+                productDetails.category = category;
+
+                await this.prisma.productDetails.create({
+                  data: {
+                    details: JSON.stringify(productDetails),
+                    filename: filename, // Save filename to the database
+                  },
+                });
+                console.log(`Successfully inserted product: ${filename}`);
+              } else {
+                console.error(
+                  `No details returned from OpenAI for file: ${filename}`,
+                );
+              }
+            } catch (parseError) {
+              console.error(
+                `Failed to parse product details for file ${filename}:`,
+                parseError,
+              );
+            }
+          } else {
+            console.log(
+              `Product with filename ${filename} already exists, skipping...`,
+            );
           }
         }
       } catch (err) {
-        console.error(JSON.stringify(err, null, 2));
+        console.error(
+          `Error reading files in category ${category}:`,
+          JSON.stringify(err, null, 2),
+        );
       }
     }
+  }
+
+  private async parseProductDetails(text: string): Promise<any> {
+    const payload = {
+      model: 'gpt-3.5-turbo',
+      messages: [{ role: 'user', content: this.inputPromptText(text) }],
+    };
+
+    try {
+      const response = await this.axiosInstance.post(
+        'chat/completions',
+        payload,
+      );
+      return response.data;
+    } catch (error: any) {
+      const errorMessage =
+        error.response?.data?.error?.message ||
+        error.message ||
+        'An error occurred';
+      throw new Error(`OpenAI API call failed: ${errorMessage}`);
+    }
+  }
+
+  private inputPromptText(input: string): string {
+    const properties = productDetailProperties.join(', ');
+
+    return `I would like to populate the following ${properties} based on the next raw data i could find about it. the following rules should be applied. specifications are a list use numbers if able to find, launch date if it can be found, category can be left blank. please output only the properties in JSON string. Here after the raw information about it ${input}`;
   }
 }
